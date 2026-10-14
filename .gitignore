@@ -1,0 +1,13 @@
+# Hidden-artifact allowlist: deny dotfiles and dotfolders everywhere in the
+# repo unless they are intentionally shared and explicitly included below.
+.*
+!/.gitignore
+!/.gitflow
+!/.claude-plugin/
+!/.claude-plugin/**
+!/.github/
+!/.github/**
+
+# Local junk
+*.log
+*.bak

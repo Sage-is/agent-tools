@@ -1,0 +1,9 @@
+{
+  "name": "sage",
+  "version": "0.1.0",
+  "description": "Sage.is agent skills: for-humanity, for-simplicity, panel-push, poka-yoke, presentation-interview, startr-init, todo-scope",
+  "author": {
+    "name": "Sage.is",
+    "url": "https://sage.is"
+  }
+}

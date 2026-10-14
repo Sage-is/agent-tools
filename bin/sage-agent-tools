@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+# sage-agent-tools: link the Sage.is agent bundles (skills, rules, sounds)
+# into Claude Code, OpenCode and Codex.
+#
+# Bundles are every $PREFIX/share/sage-agent-tools* directory, sorted, so the
+# public bundle comes first and wins a name clash. Symlink targets stay inside
+# the Homebrew share path and survive "brew upgrade".
+#
+# Exit codes: 0 ok, 1 error, 2 usage, 3 no bundle, 4 plugin route active,
+#             5 jq missing, 6 no rules fragments.
+#
+# Written for the macOS /bin/bash 3.2: no associative arrays, no mapfile.
+
+set -eu
+set -o pipefail
+
+VERSION="0.1.0"
+
+# HOME can be unset under a hook or a bare cron; fall back to the account's home
+if [ -z "${HOME:-}" ]; then
+  HOME="$(cd ~ 2>/dev/null && pwd)" || { printf 'error: HOME is not set\n' >&2; exit 1; }
+  export HOME
+fi
+
+CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+AGENTS_SKILLS="$HOME/.agents/skills"
+OPENCODE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
+RULES_BEGIN_PREFIX='<!-- sage-agent-tools rules: begin'
+RULES_END='<!-- sage-agent-tools rules: end -->'
+TAB="$(printf '\t')"
+
+DRY_RUN=0
+CLAUDE_HOOKS=0
+PREFIX=""
+BUNDLES=""            # newline-separated bundle directories, public first
+SEEN=" "              # " name name " of skills already handled this run
+STAMP=""
+BACKUP_DIR=""
+OPENCODE_BACKED_UP=0
+FAILS=0
+B_BEGIN=""
+B_END=""
+
+# ---------------------------------------------------------------- output
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$2" >&2; exit "$1"; }
+dry()  { printf '+ %s\n' "$*"; }
+
+# run CMD...: execute it, or print it under --dry-run
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+usage: sage-agent-tools <command> [--dry-run]
+
+  install                 link every bundle skill into ~/.claude/skills and
+                          ~/.agents/skills; add the bundle skill paths to
+                          OpenCode's opencode.json (skills.paths)
+  uninstall               remove those links, restore the newest backups,
+                          drop the bundle paths from opencode.json
+  status                  list each bundle skill with its link state
+  doctor                  status plus dangling links, tools, plugin route,
+                          private tap reachability
+  rules install           write the rules block into ~/.claude/CLAUDE.md and
+                          symlink ~/.config/opencode/AGENTS.md to it
+  sounds install [--claude-hooks]
+                          link the sound files into ~/.claude/sounds, install
+                          ~/.claude/play-sound.sh and the OpenCode sounds
+                          plugin; --claude-hooks also merges the hook entries
+                          into ~/.claude/settings.json (otherwise printed)
+  sounds test             put an afplay shim on PATH, run opencode and claude
+                          once; pass when opencode logs bubbles and veil and
+                          claude logs bubbles and moon
+  version                 print the version
+
+  --dry-run               print the commands, change nothing
+
+Bundles: every $PREFIX/share/sage-agent-tools* directory, public first.
+PREFIX:  $SAGE_AGENT_TOOLS_PREFIX, else $HOMEBREW_PREFIX, else "brew --prefix".
+Backups: ~/.claude/backups/<YYYY-MM-DD-HHMMSS>/ (CLAUDE_HOME overrides ~/.claude;
+         OPENCODE_CONFIG_DIR overrides ~/.config/opencode).
+Exit:    0 ok, 1 error, 2 usage, 3 no bundle, 4 plugin route active,
+         5 jq missing, 6 no rules fragments.
+EOF
+}
+
+# ---------------------------------------------------------------- bundles
+
+resolve_prefix() {
+  if [ -n "${SAGE_AGENT_TOOLS_PREFIX:-}" ]; then
+    PREFIX="$SAGE_AGENT_TOOLS_PREFIX"
+  elif [ -n "${HOMEBREW_PREFIX:-}" ]; then
+    PREFIX="$HOMEBREW_PREFIX"
+  elif command -v brew >/dev/null 2>&1; then
+    PREFIX="$(brew --prefix 2>/dev/null || true)"
+  else
+    PREFIX=""
+  fi
+}
+
+find_bundles() {
+  local d
+  BUNDLES=""
+  [ -n "$PREFIX" ] || return 0
+  for d in "$PREFIX"/share/sage-agent-tools*; do
+    [ -d "$d" ] || continue
+    BUNDLES="$BUNDLES$d
+"
+  done
+}
+
+need_bundles() {
+  [ -n "$PREFIX" ] || die 3 "no Homebrew prefix: set SAGE_AGENT_TOOLS_PREFIX or HOMEBREW_PREFIX, or install brew"
+  [ -n "$BUNDLES" ] || die 3 "no bundle under $PREFIX/share/sage-agent-tools* (brew install sage-is/apps/sage-agent-tools)"
+}
+
+need_jq() {
+  command -v jq >/dev/null 2>&1 || die 5 "jq is required (brew install jq)"
+}
+
+# bundle_tag DIR: "public" for sage-agent-tools, "private" for sage-agent-tools-private
+bundle_tag() {
+  local n
+  n="$(basename "$1")"
+  n="${n#sage-agent-tools}"
+  n="${n#-}"
+  printf '%s' "${n:-public}"
+}
+
+seen()      { case "$SEEN" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+mark_seen() { SEEN="$SEEN$1 "; }
+
+plugin_route_active() {
+  local out
+  command -v claude >/dev/null 2>&1 || return 1
+  out="$(claude plugin list 2>/dev/null || true)"
+  printf '%s\n' "$out" | grep -Eq '(^|[^A-Za-z0-9_.-])sage@'
+}
+
+# ---------------------------------------------------------------- backups
+
+ensure_backup_dir() {
+  [ -z "$BACKUP_DIR" ] || return 0
+  STAMP="$(date +%Y-%m-%d-%H%M%S)"
+  BACKUP_DIR="$CLAUDE_HOME/backups/$STAMP"
+  [ "$DRY_RUN" = 1 ] && return 0
+  while [ -e "$BACKUP_DIR" ]; do      # another run in the same second: wait for a fresh stamp
+    sleep 1
+    STAMP="$(date +%Y-%m-%d-%H%M%S)"
+    BACKUP_DIR="$CLAUDE_HOME/backups/$STAMP"
+  done
+  mkdir -p "$BACKUP_DIR"
+}
+
+# record_link DEST OLD_TARGET: note a replaced foreign symlink in links.txt
+record_link() {
+  ensure_backup_dir
+  if [ "$DRY_RUN" = 1 ]; then
+    dry "append '$1 -> $2' to $BACKUP_DIR/links.txt"
+  else
+    printf '%s -> %s\n' "$1" "$2" >> "$BACKUP_DIR/links.txt"
+  fi
+}
+
+# backup_copy SRC REL: copy SRC to backups/<stamp>/REL
+backup_copy() {
+  local d
+  ensure_backup_dir
+  d="$(dirname "$BACKUP_DIR/$2")"
+  [ -d "$d" ] || run mkdir -p "$d"
+  say "  backup $1 -> $BACKUP_DIR/$2"
+  run cp -p "$1" "$BACKUP_DIR/$2"
+}
+
+# backup_move SRC SUBDIR: move SRC into backups/<stamp>/SUBDIR/
+backup_move() {
+  ensure_backup_dir
+  say "  move   $1 -> $BACKUP_DIR/$2/"
+  [ -d "$BACKUP_DIR/$2" ] || run mkdir -p "$BACKUP_DIR/$2"
+  run mv "$1" "$BACKUP_DIR/$2/"
+}
+
+# newest_backup REL: print the newest backups/*/REL, or nothing
+newest_backup() {
+  local b found=""
+  for b in "$CLAUDE_HOME/backups"/*/; do
+    if [ -e "$b$1" ] || [ -L "$b$1" ]; then found="$b$1"; fi
+  done
+  printf '%s' "$found"
+}
+
+# recorded_link DEST: print the target a replaced foreign link DEST had, from
+# the newest backups/*/links.txt that names it, or nothing
+recorded_link() {
+  local b line found=""
+  for b in "$CLAUDE_HOME/backups"/*/; do
+    [ -f "${b}links.txt" ] || continue
+    while IFS= read -r line; do
+      case "$line" in "$1 -> "*) found="${line#"$1 -> "}" ;; esac
+    done < "${b}links.txt"
+  done
+  printf '%s' "$found"
+}
+
+# write_text FILE CONTENT: write in place (keeps the inode), adds a trailing newline
+write_text() {
+  local d
+  if [ "$DRY_RUN" = 1 ]; then
+    dry "write $1"
+    return 0
+  fi
+  d="$(dirname "$1")"
+  [ -d "$d" ] || mkdir -p "$d"
+  printf '%s\n' "$2" > "$1"
+}
+
+# ---------------------------------------------------------------- links
+
+# link_path TARGET DEST BACKUP_SUBDIR
+# identical link: no-op; foreign link: recorded then replaced; a real
+# directory or file is moved into the backup BEFORE the link is made, so
+# BSD ln never nests the link inside it as DEST/<name>.
+link_path() {
+  local target="$1" dest="$2" sub="$3" cur
+  if [ -L "$dest" ]; then
+    cur="$(readlink "$dest")"
+    if [ "$cur" = "$target" ]; then
+      say "  ok     $dest"
+      return 0
+    fi
+    record_link "$dest" "$cur"
+    say "  relink $dest (was -> $cur; recorded in $BACKUP_DIR/links.txt)"
+    run rm -f "$dest"
+  elif [ -e "$dest" ]; then
+    backup_move "$dest" "$sub"
+  elif [ ! -d "$(dirname "$dest")" ]; then
+    run mkdir -p "$(dirname "$dest")"
+  fi
+  say "  link   $dest -> $target"
+  run ln -s "$target" "$dest"
+}
+
+# state_of TARGET DEST: linked | dangling | foreign->X | real-dir | file | missing
+state_of() {
+  local cur
+  if [ -L "$2" ]; then
+    cur="$(readlink "$2")"
+    if [ "$cur" = "$1" ]; then
+      if [ -e "$2" ]; then printf 'linked'; else printf 'dangling'; fi
+    else
+      printf 'foreign->%s' "$cur"
+    fi
+  elif [ -d "$2" ]; then
+    printf 'real-dir'
+  elif [ -e "$2" ]; then
+    printf 'file'
+  else
+    printf 'missing'
+  fi
+}
+
+# unlink_dir DIR BACKUP_SUBDIR PATTERN: remove links into PATTERN*, restore
+# the newest backup copy, else the foreign link recorded in links.txt
+unlink_dir() {
+  local dir="$1" sub="$2" pat="$3" l cur name restore old
+  [ -d "$dir" ] || return 0
+  for l in "$dir"/*; do
+    [ -L "$l" ] || continue
+    cur="$(readlink "$l")"
+    case "$cur" in "$pat"*) ;; *) continue ;; esac
+    name="$(basename "$l")"
+    say "  unlink $l (-> $cur)"
+    run rm -f "$l"
+    restore="$(newest_backup "$sub/$name")"
+    if [ -n "$restore" ]; then
+      say "  restore $restore -> $l"
+      run mv "$restore" "$l"
+      continue
+    fi
+    old="$(recorded_link "$l")"
+    if [ -n "$old" ]; then
+      say "  relink $l -> $old (from links.txt)"
+      run ln -s "$old" "$l"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- opencode.json
+
+# opencode_apply JQ_ARGS... FILTER: rewrite opencode.json through jq.
+# One backup per run; a no-op when the result is unchanged.
+opencode_apply() {
+  local f="$OPENCODE_CONFIG_DIR/opencode.json" cur new
+  if [ -f "$f" ]; then
+    cur="$(jq . "$f")"
+    new="$(jq "$@" "$f")"
+  elif [ -f "$OPENCODE_CONFIG_DIR/opencode.jsonc" ]; then
+    warn "$OPENCODE_CONFIG_DIR/opencode.jsonc is not edited (jq reads plain JSON); add the skills.paths entries by hand"
+    return 0
+  else
+    cur=""
+    new="$(printf '{"$schema":"https://opencode.ai/config.json"}' | jq "$@")"
+  fi
+  if [ "$cur" = "$new" ]; then
+    say "  ok     $f"
+    return 0
+  fi
+  if [ -f "$f" ] && [ "$OPENCODE_BACKED_UP" = 0 ]; then
+    backup_copy "$f" opencode/opencode.json
+    OPENCODE_BACKED_UP=1
+  fi
+  say "  write  $f"
+  write_text "$f" "$new"
+}
+
+add_skill_path() {
+  opencode_apply --arg p "$1" '.skills.paths = (((.skills.paths // []) + [$p]) | unique)'
+}
+
+remove_skill_paths() {
+  # nothing to remove from, and nothing to create: uninstall never adds a config file
+  if [ ! -f "$OPENCODE_CONFIG_DIR/opencode.json" ] && [ ! -f "$OPENCODE_CONFIG_DIR/opencode.jsonc" ]; then
+    say "  ok     no $OPENCODE_CONFIG_DIR/opencode.json"
+    return 0
+  fi
+  opencode_apply --arg p "$1" 'if (.skills.paths | type) == "array"
+    then .skills.paths |= map(select((type == "string" and startswith($p)) | not))
+    else . end'
+}
+
+# check_opencode_json: stop before any link is touched when opencode.json is not
+# plain JSON (a comment, a trailing comma, a hand edit); jq's own exit 5 would
+# otherwise surface half-way through as "jq missing"
+check_opencode_json() {
+  local f="$OPENCODE_CONFIG_DIR/opencode.json"
+  [ -f "$f" ] || return 0
+  jq -e 'type == "object"' "$f" >/dev/null 2>&1 \
+    || die 1 "$f is not a plain JSON object; fix it or add/remove the skills.paths entries by hand"
+}
+
+opencode_has_path() {
+  local f="$OPENCODE_CONFIG_DIR/opencode.json"
+  [ -f "$f" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e --arg p "$1" '[(.skills.paths // [])[] | select(. == $p)] | length > 0' "$f" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- install / uninstall
+
+cmd_install() {
+  local b s name
+  need_jq
+  need_bundles
+  check_opencode_json
+  if plugin_route_active; then
+    die 4 "the Claude Code plugin route is active ('claude plugin list' shows sage@); one route per machine: run 'claude plugin uninstall sage' first, or keep the plugin and skip this installer"
+  fi
+  say "sage-agent-tools v$VERSION install (prefix $PREFIX)"
+  [ "$DRY_RUN" = 0 ] || say "dry run: printing commands, changing nothing"
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    say "bundle $b ($(bundle_tag "$b"))"
+    for s in "$b"/skills/*/; do
+      [ -d "$s" ] || continue
+      s="${s%/}"
+      name="$(basename "$s")"
+      if seen "$name"; then
+        say "  skip   $name: an earlier bundle already provides it"
+        continue
+      fi
+      mark_seen "$name"
+      link_path "$s" "$CLAUDE_HOME/skills/$name" skills
+      link_path "$s" "$AGENTS_SKILLS/$name" agents-skills
+    done
+    if [ -d "$b/skills" ]; then add_skill_path "$b/skills"; fi
+  done <<EOF
+$BUNDLES
+EOF
+  say "done. next: sage-agent-tools rules install"
+}
+
+cmd_uninstall() {
+  local pat
+  need_jq
+  [ -n "$PREFIX" ] || die 3 "no Homebrew prefix: set SAGE_AGENT_TOOLS_PREFIX or HOMEBREW_PREFIX, or install brew"
+  check_opencode_json
+  pat="$PREFIX/share/sage-agent-tools"
+  say "sage-agent-tools v$VERSION uninstall (links into $pat*)"
+  [ "$DRY_RUN" = 0 ] || say "dry run: printing commands, changing nothing"
+  unlink_dir "$CLAUDE_HOME/skills" skills "$pat"
+  unlink_dir "$AGENTS_SKILLS" agents-skills "$pat"
+  unlink_dir "$CLAUDE_HOME/sounds" sounds "$pat"
+  remove_skill_paths "$pat"
+  say "done. the rules block in $CLAUDE_HOME/CLAUDE.md, play-sound.sh and the OpenCode sounds plugin stay; remove them by hand if wanted"
+}
+
+# ---------------------------------------------------------------- status / doctor
+
+check_ok()   { say "  ok     $*"; }
+check_info() { say "  info   $*"; }
+check_fail() { FAILS=$((FAILS + 1)); say "  FAIL   $*"; }
+
+print_status() {
+  local b s name n
+  say "sage-agent-tools v$VERSION"
+  say "prefix:   ${PREFIX:-(none)}"
+  say "claude:   $CLAUDE_HOME"
+  say "agents:   $AGENTS_SKILLS"
+  say "opencode: $OPENCODE_CONFIG_DIR"
+  if [ -z "$BUNDLES" ]; then
+    say "bundles:  none under ${PREFIX:-(none)}/share/sage-agent-tools*"
+    return 0
+  fi
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    say "bundle $b ($(bundle_tag "$b"))"
+    for s in "$b"/skills/*/; do
+      [ -d "$s" ] || continue
+      s="${s%/}"
+      name="$(basename "$s")"
+      if seen "$name"; then
+        printf '  %-24s %s\n' "$name" "skipped: name clash, an earlier bundle provides it"
+        continue
+      fi
+      mark_seen "$name"
+      printf '  %-24s claude:%-10s agents:%s\n' "$name" \
+        "$(state_of "$s" "$CLAUDE_HOME/skills/$name")" \
+        "$(state_of "$s" "$AGENTS_SKILLS/$name")"
+    done
+    if [ -d "$b/skills" ]; then
+      if opencode_has_path "$b/skills"; then
+        say "  opencode skills.paths: has $b/skills"
+      else
+        say "  opencode skills.paths: missing $b/skills"
+      fi
+    fi
+    n=0
+    for s in "$b"/rules/[0-9]*-*.md; do [ -f "$s" ] && n=$((n + 1)); done
+    say "  rules fragments: $n"
+    if [ -d "$b/sounds" ]; then
+      n=0
+      for s in "$b"/sounds/*.mp3; do [ -f "$s" ] && n=$((n + 1)); done
+      say "  sounds: $n mp3 files"
+    fi
+  done <<EOF
+$BUNDLES
+EOF
+  block_bounds "$CLAUDE_HOME/CLAUDE.md"
+  if [ -n "$B_BEGIN" ]; then
+    say "rules:    block present in $CLAUDE_HOME/CLAUDE.md ($(sed -n "${B_BEGIN}p" "$CLAUDE_HOME/CLAUDE.md"))"
+  else
+    say "rules:    no block in $CLAUDE_HOME/CLAUDE.md"
+  fi
+  say "AGENTS.md: $(state_of "$CLAUDE_HOME/CLAUDE.md" "$OPENCODE_CONFIG_DIR/AGENTS.md")"
+  if [ -x "$CLAUDE_HOME/play-sound.sh" ]; then
+    if [ -f "$OPENCODE_CONFIG_DIR/plugin/sounds.js" ]; then n="present"; else n="missing"; fi
+    say "sounds:   play-sound.sh installed, OpenCode plugin/sounds.js $n"
+  else
+    say "sounds:   play-sound.sh not installed"
+  fi
+  return 0
+}
+
+cmd_status() {
+  print_status
+}
+
+dangling_in() {
+  local l
+  [ -d "$1" ] || return 0
+  for l in "$1"/*; do
+    if [ -L "$l" ] && [ ! -e "$l" ]; then
+      check_fail "dangling link $l -> $(readlink "$l")"
+    fi
+  done
+}
+
+cmd_doctor() {
+  local t repo
+  print_status
+  say ""
+  say "checks"
+  if [ -n "$PREFIX" ] && [ -d "$PREFIX/share" ]; then
+    check_ok "prefix reachable: $PREFIX/share"
+  else
+    check_fail "prefix not reachable: ${PREFIX:-(none)}/share"
+  fi
+  if [ -n "$BUNDLES" ]; then check_ok "bundles found"; else check_fail "no bundle (brew install sage-is/apps/sage-agent-tools)"; fi
+  dangling_in "$CLAUDE_HOME/skills"
+  dangling_in "$AGENTS_SKILLS"
+  dangling_in "$CLAUDE_HOME/sounds"
+  for t in claude opencode codex; do
+    if command -v "$t" >/dev/null 2>&1; then check_ok "$t: $(command -v "$t")"; else check_info "$t: not on PATH"; fi
+  done
+  if command -v jq >/dev/null 2>&1; then check_ok "jq: $(command -v jq)"; else check_fail "jq missing (brew install jq)"; fi
+  if command -v claude >/dev/null 2>&1; then
+    if plugin_route_active; then
+      check_fail "plugin route active: 'claude plugin list' shows sage@; one route per machine"
+    else
+      check_ok "plugin route not active"
+    fi
+  fi
+  if [ -e "$OPENCODE_CONFIG_DIR/plugin/sounds.js" ] && [ -e "$OPENCODE_CONFIG_DIR/plugins/sounds.js" ]; then
+    check_fail "both plugin/sounds.js and plugins/sounds.js exist under $OPENCODE_CONFIG_DIR: OpenCode loads both, every sound plays twice"
+  fi
+  if [ -L "$OPENCODE_CONFIG_DIR/AGENTS.md" ] && [ ! -e "$OPENCODE_CONFIG_DIR/AGENTS.md" ]; then
+    check_fail "dangling link $OPENCODE_CONFIG_DIR/AGENTS.md -> $(readlink "$OPENCODE_CONFIG_DIR/AGENTS.md")"
+  fi
+  if command -v brew >/dev/null 2>&1; then
+    repo="$(brew --repo sage-is/private 2>/dev/null || true)"
+    if [ -n "$repo" ] && [ -d "$repo" ]; then
+      # GIT_TERMINAL_PROMPT=0: a missing credential must fail, not prompt and hang
+      if GIT_TERMINAL_PROMPT=0 git -C "$repo" ls-remote -q origin HEAD >/dev/null 2>&1; then
+        check_ok "private tap reachable: $repo"
+      else
+        check_fail "private tap: credential missing or expired: git ls-remote $(git -C "$repo" config --get remote.origin.url 2>/dev/null || printf '%s' "$repo")"
+      fi
+    else
+      check_info "private tap sage-is/private not installed"
+    fi
+  fi
+  if [ "$FAILS" -gt 0 ]; then
+    say "$FAILS problem(s) found"
+    return 1
+  fi
+  say "all checks passed"
+}
+
+# ---------------------------------------------------------------- rules
+
+# block_bounds FILE: set B_BEGIN/B_END to the marker line numbers, or empty.
+# Markers match whole lines only, so a fragment that quotes one inline
+# (`<!-- sage-agent-tools rules: end -->` in a sentence) does not end the block.
+block_bounds() {
+  local nums line n
+  B_BEGIN=""
+  B_END=""
+  [ -f "$1" ] || return 0
+  nums="$(grep -n -E "^$RULES_BEGIN_PREFIX v[^ ]* -->\$" "$1" || true)"
+  [ -z "$nums" ] || B_BEGIN="${nums%%:*}"
+  [ -n "$B_BEGIN" ] || return 0
+  nums="$(grep -n -x -F -- "$RULES_END" "$1" || true)"
+  while IFS= read -r line; do        # the first end marker after the begin marker
+    n="${line%%:*}"
+    if [ -n "$n" ] && [ "$n" -gt "$B_BEGIN" ]; then B_END="$n"; break; fi
+  done <<EOF
+$nums
+EOF
+  if [ -z "$B_END" ]; then
+    B_BEGIN=""
+  fi
+}
+
+# outside_block FILE: print the file without the marker block
+outside_block() {
+  block_bounds "$1"
+  if [ -z "$B_BEGIN" ]; then
+    cat "$1"
+    return 0
+  fi
+  if [ "$B_BEGIN" -gt 1 ]; then sed -n "1,$((B_BEGIN - 1))p" "$1"; fi
+  sed -n "$((B_END + 1)),\$p" "$1"
+}
+
+# collect_fragments: "basename<TAB>path" for rules/[0-9]*-*.md of every bundle, sorted by basename
+collect_fragments() {
+  local b f
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    for f in "$b"/rules/[0-9]*-*.md; do
+      [ -f "$f" ] || continue
+      printf '%s\t%s\n' "$(basename "$f")" "$f"
+    done
+  done <<EOF
+$BUNDLES
+EOF
+}
+
+# build_rules_block FRAGS: the managed block, markers included
+build_rules_block() {
+  local name path
+  printf '%s\n' "$RULES_BEGIN_PREFIX v$VERSION -->"
+  printf '%s\n' "<!-- managed by sage-agent-tools: edit the bundle rules/ fragments and rerun 'sage-agent-tools rules install'; text outside the markers is kept -->"
+  while IFS="$TAB" read -r name path; do
+    [ -n "$path" ] || continue
+    printf '\n'
+    # the fragment without its trailing blank lines, ending in one newline,
+    # so fragments are separated by exactly one blank line
+    awk '{ l[NR] = $0 } END { n = NR; while (n > 0 && l[n] ~ /^[[:space:]]*$/) n--; for (i = 1; i <= n; i++) print l[i] }' "$path"
+  done <<EOF
+$1
+EOF
+  printf '\n%s\n' "$RULES_END"
+}
+
+link_agents_md() {
+  local dest="$OPENCODE_CONFIG_DIR/AGENTS.md" target="$CLAUDE_HOME/CLAUDE.md" cur
+  # the same inode (CLAUDE.md -> AGENTS.md, or a hard link): removing DEST here
+  # would turn the pair into a loop, and both tools already read one file
+  if [ -e "$dest" ] && [ "$dest" -ef "$target" ] && [ ! -L "$dest" ]; then
+    say "  ok     $dest already shares its file with $target (reverse link kept as is)"
+    return 0
+  fi
+  if [ -L "$dest" ]; then
+    cur="$(readlink "$dest")"
+    if [ "$cur" = "$target" ]; then
+      say "  ok     $dest -> $target"
+      return 0
+    fi
+    record_link "$dest" "$cur"
+    say "  relink $dest (was -> $cur)"
+    run rm -f "$dest"
+  elif [ -d "$dest" ]; then
+    die 1 "$dest is a directory; move it aside and rerun"
+  elif [ -e "$dest" ]; then
+    backup_copy "$dest" opencode/AGENTS.md
+    run rm -f "$dest"
+  elif [ ! -d "$OPENCODE_CONFIG_DIR" ]; then
+    run mkdir -p "$OPENCODE_CONFIG_DIR"
+  fi
+  say "  link   $dest -> $target"
+  run ln -s "$target" "$dest"
+}
+
+cmd_rules_install() {
+  local frags block n names target agents had_markers=0 head_part="" tail_part="" outside="" agents_extra="" new
+  need_bundles
+  target="$CLAUDE_HOME/CLAUDE.md"
+  agents="$OPENCODE_CONFIG_DIR/AGENTS.md"
+  frags="$(collect_fragments | LC_ALL=C sort -t "$TAB" -k1,1 -k2,2)"
+  [ -n "$frags" ] || die 6 "no rules fragments (rules/[0-9]*-*.md) in any bundle"
+  n="$(printf '%s\n' "$frags" | wc -l | tr -d ' ')"
+  names="$(printf '%s\n' "$frags" | cut -f1 | tr '\n' ' ')"
+  say "sage-agent-tools v$VERSION rules install: $n fragment(s): $names"
+  [ "$DRY_RUN" = 0 ] || say "dry run: printing commands, changing nothing"
+  block="$(build_rules_block "$frags")"
+
+  if [ -f "$target" ]; then
+    block_bounds "$target"
+    if [ -n "$B_BEGIN" ]; then
+      had_markers=1
+      if [ "$B_BEGIN" -gt 1 ]; then head_part="$(sed -n "1,$((B_BEGIN - 1))p" "$target")"; fi
+      tail_part="$(sed -n "$((B_END + 1)),\$p" "$target")"
+    fi
+    outside="$(outside_block "$target")"
+  fi
+
+  # a regular AGENTS.md is kept: its text goes below the block unless CLAUDE.md already holds it
+  if [ -f "$agents" ] && [ ! -L "$agents" ]; then
+    agents_extra="$(outside_block "$agents")"
+    if [ -z "$(printf '%s' "$agents_extra" | tr -d '[:space:]')" ] || [ "$agents_extra" = "$outside" ]; then
+      agents_extra=""
+    fi
+  fi
+
+  new="$block"
+  if [ "$had_markers" = 1 ]; then
+    [ -z "$head_part" ] || new="$head_part
+
+$new"
+    [ -z "$tail_part" ] || new="$new
+$tail_part"
+    say "  update $target (block replaced, text outside the markers kept)"
+  elif [ -f "$target" ]; then
+    backup_copy "$target" CLAUDE.md
+    [ -z "$outside" ] || new="$new
+
+$outside"
+    say "  update $target (no markers found: block added on top, existing text kept below)"
+  else
+    say "  create $target"
+  fi
+  if [ -n "$agents_extra" ]; then
+    say "  merge  $agents text below the block"
+    new="$new
+
+<!-- merged from $agents by sage-agent-tools -->
+$agents_extra"
+  fi
+  write_text "$target" "$new"
+  link_agents_md
+  say "done."
+}
+
+# ---------------------------------------------------------------- sounds
+
+sounds_bundle() {
+  local b
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    if [ -f "$b/sounds/play-sound.sh" ]; then
+      printf '%s' "$b"
+      return 0
+    fi
+  done <<EOF
+$BUNDLES
+EOF
+  return 1
+}
+
+# install_file SRC DEST BACKUP_REL: copy with a backup of a differing DEST
+install_file() {
+  local src="$1" dest="$2" rel="$3"
+  if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$src" "$dest"; then
+    say "  ok     $dest"
+    return 0
+  fi
+  if [ -L "$dest" ]; then
+    record_link "$dest" "$(readlink "$dest")"
+    say "  unlink $dest"
+    run rm -f "$dest"
+  elif [ -e "$dest" ]; then
+    backup_copy "$dest" "$rel"
+  elif [ ! -d "$(dirname "$dest")" ]; then
+    run mkdir -p "$(dirname "$dest")"
+  fi
+  say "  copy   $src -> $dest"
+  run cp "$src" "$dest"
+  case "$dest" in *.sh) run chmod +x "$dest" ;; esac
+}
+
+# Dedupe on the inner command strings, not on whole groups: a group that already
+# carries the command next to another one (or with a matcher or timeout) must not
+# get a second copy, or the sound plays twice.
+MERGE_HOOKS_FILTER='($h[0].hooks // {}) as $new
+  | .hooks = ((.hooks // {}) as $cur
+      | reduce ($new | to_entries[]) as $e ($cur;
+          .[$e.key] = ((.[$e.key] // []) as $have
+            | [ $have[]?.hooks[]?.command ] as $seen
+            | $have + [ $e.value[]
+                | .hooks |= map(select(.command as $c | any($seen[]; . == $c) | not))
+                | select((.hooks | length) > 0) ])))'
+
+# merge_claude_hooks HOOKS_JSON: add missing hook entries to settings.json
+merge_claude_hooks() {
+  local f="$CLAUDE_HOME/settings.json" cur new
+  if [ -f "$f" ]; then
+    cur="$(jq . "$f")"
+    new="$(jq --slurpfile h "$1" "$MERGE_HOOKS_FILTER" "$f")"
+  else
+    cur=""
+    new="$(jq -n --slurpfile h "$1" "$MERGE_HOOKS_FILTER")"
+  fi
+  if [ "$cur" = "$new" ]; then
+    say "  ok     $f already has the hook entries"
+    return 0
+  fi
+  [ ! -f "$f" ] || backup_copy "$f" settings.json
+  say "  write  $f (hook entries merged)"
+  write_text "$f" "$new"
+}
+
+cmd_sounds_install() {
+  local src f name legacy
+  need_bundles
+  src="$(sounds_bundle)" || die 3 "no bundle ships sounds/play-sound.sh (brew install sage-is/private/sage-agent-tools-private)"
+  say "sage-agent-tools v$VERSION sounds install (from $src/sounds)"
+  [ "$DRY_RUN" = 0 ] || say "dry run: printing commands, changing nothing"
+  for f in "$src"/sounds/*.mp3; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f")"
+    link_path "$f" "$CLAUDE_HOME/sounds/$name" sounds
+  done
+  install_file "$src/sounds/play-sound.sh" "$CLAUDE_HOME/play-sound.sh" play-sound.sh
+  if [ -f "$src/sounds/sounds.js" ]; then
+    install_file "$src/sounds/sounds.js" "$OPENCODE_CONFIG_DIR/plugin/sounds.js" opencode/plugin/sounds.js
+    legacy="$OPENCODE_CONFIG_DIR/plugins/sounds.js"
+    if [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      say "  OpenCode loads both plugin/ and plugins/; the older copy moves to the backup so sounds play once"
+      backup_move "$legacy" opencode/plugins
+    fi
+  fi
+  if [ -f "$src/sounds/claude-hooks.json" ]; then
+    if [ "$CLAUDE_HOOKS" = 1 ]; then
+      need_jq
+      merge_claude_hooks "$src/sounds/claude-hooks.json"
+    else
+      say "  $CLAUDE_HOME/settings.json untouched; rerun with --claude-hooks to merge these hook entries, or add them by hand:"
+      cat "$src/sounds/claude-hooks.json"
+    fi
+  fi
+  say "done. check with: sage-agent-tools sounds test"
+}
+
+# sound_probe TMP LOG SETTLE WANT CMD...: run CMD with the afplay shim first on
+# PATH; pass only when every mp3 basename in WANT (space-separated) was logged
+sound_probe() {
+  local tmp="$1" log="$2" settle="$3" want="$4" tool="$5" out pid i timeout="${SAGE_SOUNDS_TIMEOUT:-120}" names w missing=""
+  shift 4
+  out="$tmp/$tool.out"
+  : > "$log"
+  env -u CLAUDECODE PATH="$tmp/bin:$PATH" "$@" > "$out" 2>&1 < /dev/null &
+  pid=$!
+  i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt $((timeout * 5)) ]; do
+    sleep 0.2
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "$tool: still running after ${timeout}s, killing it"
+    kill "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+  sleep "$settle"      # play-sound.sh backgrounds afplay; let the shim finish writing
+  names="$(grep -oE '[^/ ]+\.mp3' "$log" 2>/dev/null | awk '!seen[$0]++' | tr '\n' ' ' || true)"
+  names="${names% }"
+  for w in $want; do
+    case " $names " in *" $w "*) ;; *) missing="$missing$w " ;; esac
+  done
+  if [ -z "$missing" ]; then
+    say "$tool: ok, played $names"
+    return 0
+  fi
+  say "$tool: FAIL, played ${names:-nothing}; missing ${missing% } (last lines of its output follow)"
+  tail -n 5 "$out" 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
+cmd_sounds_test() {
+  local tmp shim log rc=0 found=0 settle="${SAGE_SOUNDS_SETTLE:-2}"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/sage-sounds-test.XXXXXX")"
+  mkdir -p "$tmp/bin"
+  log="$tmp/afplay.log"
+  : > "$log"
+  shim="$tmp/bin/afplay"
+  cat > "$shim" <<EOF
+#!/bin/sh
+# afplay shim for "sage-agent-tools sounds test": log the arguments instead of playing
+printf '%s\\n' "\$*" >> "$log"
+EOF
+  chmod +x "$shim"
+  say "sage-agent-tools v$VERSION sounds test (afplay shim: $shim)"
+  if [ "$DRY_RUN" = 1 ]; then
+    dry "PATH=$tmp/bin:\$PATH opencode run 'reply with the single word ok'          (when opencode is on PATH)"
+    dry "PATH=$tmp/bin:\$PATH claude -p 'reply with the single word ok' --max-turns 1   (when claude is on PATH)"
+    rm -rf "$tmp"
+    return 0
+  fi
+  # expected per tool: session start (bubbles) then idle (veil) for OpenCode,
+  # session start (bubbles) and session end (moon) for Claude Code
+  if command -v opencode >/dev/null 2>&1; then
+    found=1
+    sound_probe "$tmp" "$log" "$settle" "patatap-bubbles.mp3 patatap-veil.mp3" \
+      opencode run 'reply with the single word ok' || rc=1
+  else
+    say "opencode: not on PATH, skipped"
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    found=1
+    sound_probe "$tmp" "$log" "$settle" "patatap-bubbles.mp3 patatap-moon.mp3" \
+      claude -p 'reply with the single word ok' --max-turns 1 || rc=1
+  else
+    say "claude: not on PATH, skipped"
+  fi
+  [ "$found" = 1 ] || say "neither opencode nor claude is on PATH; nothing to test"
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  local a pos1="" pos2=""
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) DRY_RUN=1 ;;
+      --claude-hooks) CLAUDE_HOOKS=1 ;;
+      -h|--help|help) usage; exit 0 ;;
+      -V|--version) say "sage-agent-tools v$VERSION"; exit 0 ;;
+      -*) usage >&2; die 2 "unknown option: $a" ;;
+      *)
+        if [ -z "$pos1" ]; then pos1="$a"
+        elif [ -z "$pos2" ]; then pos2="$a"
+        else usage >&2; die 2 "too many arguments"
+        fi ;;
+    esac
+  done
+  if [ -z "$pos1" ]; then
+    usage >&2
+    exit 2
+  fi
+  if [ "$pos1" = version ] && [ -z "$pos2" ]; then
+    say "sage-agent-tools v$VERSION"
+    exit 0
+  fi
+  resolve_prefix
+  find_bundles
+  case "$pos1 $pos2" in
+    "install ")       cmd_install ;;
+    "uninstall ")     cmd_uninstall ;;
+    "status ")        cmd_status ;;
+    "doctor ")        cmd_doctor ;;
+    "rules install")  cmd_rules_install ;;
+    "sounds install") cmd_sounds_install ;;
+    "sounds test")    cmd_sounds_test ;;
+    *) usage >&2; die 2 "unknown command: $pos1 $pos2" ;;
+  esac
+}
+
+main "$@"

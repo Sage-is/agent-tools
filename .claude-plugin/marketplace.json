@@ -1,0 +1,14 @@
+{
+  "name": "sage-agent-tools",
+  "description": "Sage.is agent skills for coding agents",
+  "owner": {
+    "name": "Sage.is"
+  },
+  "plugins": [
+    {
+      "name": "sage",
+      "source": "./",
+      "description": "Sage.is agent skills"
+    }
+  ]
+}
