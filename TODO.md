@@ -20,13 +20,11 @@ This file tracks active work only.
 
 ## TODO
 
-- [ ] **First release v0.1.0**: nothing is pushed before the review gate #critical
-  - [ ] [MANUALLY] Review gate: `make review`, read every file in the tick table, decide the Dorie Clark wording in `presentation-interview` (`NOTICE.md` covers the current wording), add client names to `~/.config/sage-agent-tools/denylist.txt`, rerun `make review`
-    - [ ] Expect `rules/40-startr-style.md` to differ from the source CLAUDE.md section on two lines, not one: line 3 (repo path -> `https://github.com/Startr/Style`) and line 7 (`Never edit ... silently` names `Startr/Style`); both rewrites are forced by the `WEB-[A-Za-z]` denylist entry
-    - [ ] Decide once whether both formulas keep the explicit `version "0.1.0"` line (then `brew audit --strict` prints "version 0.1.0 is redundant with version scanned from URL" on every release, as `tool-release.sh` and `private-release.sh` expect) or drop it and relax those two scripts' `version` checks
-  - [ ] [WE] Push `develop` and `master`, then `make release` to tag `v0.1.0`
-  - [ ] [WE] Tap: `make check_names NAMES=sage-agent-tools`, add `Formula/sage-agent-tools.rb`, `make tool_release TOOL=sage-agent-tools VERSION=0.1.0` as a dry run, then with `APPLY=1`
-  - [ ] [WE] `brew test sage-agent-tools` and `sage-agent-tools doctor` both exit 0
+- [x] **First release v0.1.0**: reviewed, tagged and on both taps (Alexander, 2026-10-14) #critical
+  - [x] [MANUALLY] Review gate walked on the 51-row checklist; `presentation-interview` now takes `persona` (default) or `style`; no client names found in the public tree (denylist stays open for additions); patatap audio stays private until replaced
+  - [x] [WE] `version` line dropped from the formula; `tool-release.sh` and `release-tools.sh` derive it from the `v<X.Y.Z>.tar.gz` url, so `brew audit --strict` is clean
+  - [x] [WE] `develop` and `master` pushed, `v0.1.0` tagged; `sage-is/apps/sage-agent-tools` pinned to sha256 `a3167176…`, installed, tested, audited
+  - [x] [WE] Private: `Sage.is/agent-tools-private` `v0.1.0` and `sage-is/private/sage-agent-tools-private` pinned (Gitea archive with `HOMEBREW_GITEA_TOKEN` header); `sage-agent-tools install`, `rules install`, `sounds install` and `doctor` green on the first Mac
 
 - [ ] **Split the long SKILL.md files into `references/`**: a line-for-line copy ships first so the review reads the files as they were
   - [ ] [WE] `for-humanity` (673 lines): pattern catalogue to `references/`
@@ -36,7 +34,7 @@ This file tracks active work only.
   - [ ] [WE] `make check` still passes and each SKILL.md names its reference files
 
 - [ ] **Move `sounds/` to the public bundle**: the seven patatap mp3s, `play-sound.sh`, `sounds.js` and `claude-hooks.json` ship in the private bundle until their licence is known
-  - [ ] [MANUALLY] Confirm the patatap audio licence allows redistribution
+  - [ ] [MANUALLY] Confirm the patatap audio licence allows redistribution, or replace the seven cues: asked Izzy (iplante@sage.is) for custom cues on 2026-10-14, 20-minute call proposed for the week of 2026-10-19
   - [ ] [WE] Move `sounds/` here, add `sounds` to `pkgshare.install` in the formula, add the attribution to `NOTICE.md`
   - [ ] [WE] `sage-agent-tools sounds test` passes on a clean temp HOME after the move
 
