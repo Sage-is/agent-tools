@@ -158,7 +158,17 @@ case "$1" in
     echo ok ;;
 esac
 EOF
-chmod +x "$TMP/bin/claude" "$TMP/bin/opencode"
+# fake brew: the prefix is the test's; no private tap, so doctor never reaches
+# the real machine's tap or its keychain credential
+cat > "$TMP/bin/brew" <<'EOF'
+#!/bin/sh
+case "$1" in
+  --prefix) echo "${SAGE_AGENT_TOOLS_PREFIX:-/nonexistent}" ;;
+  --repo)   exit 1 ;;
+  *)        exit 1 ;;
+esac
+EOF
+chmod +x "$TMP/bin/claude" "$TMP/bin/opencode" "$TMP/bin/brew"
 
 # ---------------------------------------------------------------- basics
 
