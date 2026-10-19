@@ -26,6 +26,15 @@ This file tracks active work only.
   - [x] [WE] `develop` and `master` pushed, `v0.1.0` tagged; `sage-is/apps/sage-agent-tools` pinned to sha256 `a3167176…`, installed, tested, audited
   - [x] [WE] Private: `Sage.is/agent-tools-private` `v0.1.0` and `sage-is/private/sage-agent-tools-private` pinned (Gitea archive with `HOMEBREW_GITEA_TOKEN` header); `sage-agent-tools install`, `rules install`, `sounds install` and `doctor` green on the first Mac
 
+- [ ] **AGENTS.md in every project**: `sage-agent-tools agents-md` moves project rules into AGENTS.md; CLAUDE.md becomes `@AGENTS.md` (Alexander, 2026-10-19)
+  - [x] [WE] Subcommand with `--all`, `--prune`, `--nested`, `--dry-run`; below-root files report-only; `forensics/` never walked; 56 new assertions in `tests/installer.sh`; rule `45-agents-md.md`; README section
+  - [ ] [MANUALLY] Review and commit; ship in the next release, then `sage-agent-tools rules install`
+  - [x] [WE] Sweep the projects folder: CleanRoom and SCI-Recomp converted 2026-10-19 (uncommitted); FluidAudio and transatlantic stay (upstream ships CLAUDE.md)
+  - [ ] [MANUALLY] Commit CLAUDE.md + AGENTS.md in CleanRoom and SCI-Recomp
+  - [ ] [MANUALLY] Commit AGENTS.md next to the shim in AI--Sage-is-pullbot-agents, WEB-Startr.Team, kokoro-coreml, local-whisper, DeepSlides
+  - [ ] [WE] Merge sg-stack's CLAUDE.md (497 lines) into its AGENTS.md (49 lines)
+  - [ ] [MANUALLY] 2026-12-19: confirm no client runs below Claude Code 2.1.277, then [WE] `agents-md --all --prune` on the projects folder
+
 - [ ] **Split the long SKILL.md files into `references/`**: a line-for-line copy ships first so the review reads the files as they were
   - [ ] [WE] `for-humanity` (673 lines): pattern catalogue to `references/`
   - [ ] [WE] `startr-init` (438 lines): Makefile blocks to `references/`

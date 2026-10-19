@@ -1,0 +1,3 @@
+## Project Rules Live in AGENTS.md
+
+Every project keeps its agent rules in `AGENTS.md`, which every coding agent reads. `CLAUDE.md` holds one line, `@AGENTS.md`, so older Claude Code versions load the same rules. Add or change project rules in `AGENTS.md`, never in `CLAUDE.md`; if `/init` rewrites `CLAUDE.md`, move its text into `AGENTS.md` and restore the import. After creating, cloning or ingesting a project, run `sage-agent-tools agents-md --dry-run`, then again without `--dry-run`. It never touches git and leaves alone a fork's `CLAUDE.md` that upstream ships. Once no client runs below Claude Code 2.1.277, `sage-agent-tools agents-md --prune` deletes the shims.

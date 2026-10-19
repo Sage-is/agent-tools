@@ -407,6 +407,130 @@ assert_exit "uninstall exits 0" 0 sat uninstall
 assert_not "mp3 link removed" test -L "$CLAUDE_HOME/sounds/patatap-bubbles.mp3"
 assert "play-sound.sh stays" test -x "$CLAUDE_HOME/play-sound.sh"
 
+# ---------------------------------------------------------------- agents-md
+
+g() { git -c user.name=t -c user.email=t@example.com -c init.defaultBranch=main -c commit.gpgsign=false "$@"; }
+nlinks() { stat -c %h "$1" 2>/dev/null || stat -f %l "$1"; }
+# tree_sum DIR: every file outside .git with its checksum, and every symlink
+tree_sum() {
+  { find "$1" -path '*/.git' -prune -o -type f -exec cksum {} + ; find "$1" -type l -print; } | LC_ALL=C sort
+}
+# normalised: a TMPDIR ending in "/" leaves "//" in $TMP, and the report prints pwd's form
+P="$(cd "$TMP" && pwd)/projects"
+SHIM='@AGENTS.md'
+STOCK='This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.'
+
+mkdir -p "$P/own/sub" "$P/own/docs/tpl" "$P/own/vendor/lib" "$P/own/node_modules/x" "$P/own/inner" "$P/own/.claude" \
+  "$P/done" "$P/half" "$P/both" "$P/twin" "$P/agentsonly" "$P/hard" "$P/extra" "$P/linked" "$TMP/lone/broken"
+printf '# CLAUDE.md\n\n%s\n\n- rule one\n' "$STOCK" > "$P/own/CLAUDE.md"
+printf '# sub rules\n' > "$P/own/sub/CLAUDE.md"
+printf 'template, not rules\n' > "$P/own/docs/tpl/AGENTS.md"
+printf 'vendored\n' > "$P/own/vendor/lib/AGENTS.md"
+printf 'dependency\n' > "$P/own/node_modules/x/CLAUDE.md"
+printf 'claude-only folder\n' > "$P/own/.claude/CLAUDE.md"
+mkdir -p "$P/own/forensics/skill" "$P/forensics/kit"
+printf '# evidence\n' > "$P/own/forensics/skill/CLAUDE.md"
+printf '# evidence\n' > "$P/forensics/kit/CLAUDE.md"
+g -C "$P/own" init -q && g -C "$P/own" add CLAUDE.md && g -C "$P/own" commit -qm init
+g -C "$P/own/inner" init -q && printf '# inner repo\n' > "$P/own/inner/CLAUDE.md"
+printf '%s\n' "$SHIM" > "$P/done/CLAUDE.md"; printf '# done\n' > "$P/done/AGENTS.md"
+g -C "$P/half" init -q && printf '%s\n' "$SHIM" > "$P/half/CLAUDE.md" && g -C "$P/half" add CLAUDE.md && g -C "$P/half" commit -qm init
+printf '# half\n' > "$P/half/AGENTS.md"
+printf '# both claude\n' > "$P/both/CLAUDE.md"; printf '# both agents\n' > "$P/both/AGENTS.md"
+printf '# twin\n' > "$P/twin/CLAUDE.md"; printf '# twin\n' > "$P/twin/AGENTS.md"
+printf '# agents only\n' > "$P/agentsonly/AGENTS.md"
+printf '# shared\n' > "$TMP/shared.md"; ln "$TMP/shared.md" "$P/hard/CLAUDE.md"
+printf '%s\n\n## Claude-only\n- extra\n' "$SHIM" > "$P/extra/CLAUDE.md"; printf '# extra\n' > "$P/extra/AGENTS.md"
+printf '# linked\n' > "$P/linked/AGENTS.md"; ln -s AGENTS.md "$P/linked/CLAUDE.md"
+printf '%s\n' "$SHIM" > "$TMP/lone/broken/CLAUDE.md"
+# fork: upstream ships CLAUDE.md; fork2: upstream does not, the fork added one
+mkdir -p "$TMP/up1" "$TMP/up2"
+g -C "$TMP/up1" init -q && printf '# upstream rules\n' > "$TMP/up1/CLAUDE.md" && g -C "$TMP/up1" add . && g -C "$TMP/up1" commit -qm up
+g -C "$TMP/up2" init -q && printf 'readme\n' > "$TMP/up2/README" && g -C "$TMP/up2" add . && g -C "$TMP/up2" commit -qm up
+g clone -q -o upstream "$TMP/up1" "$P/fork"
+g clone -q -o upstream "$TMP/up2" "$P/fork2" && printf '# fork rules\n' > "$P/fork2/CLAUDE.md"
+
+printf '== agents-md --dry-run\n'
+before="$(tree_sum "$P")"
+assert_exit "agents-md --all --dry-run exits 0" 0 sat agents-md --all --dry-run "$P"
+assert_eq "dry run changes nothing" "$before" "$(tree_sum "$P")"
+assert "dry run prints the AGENTS.md write" grep -q "write $P/own/AGENTS.md" "$TMP/last.out"
+
+printf '== agents-md --all\n'
+assert_exit "agents-md --all exits 0" 0 sat agents-md --all "$P"
+cp "$TMP/last.out" "$TMP/am.out"
+assert_eq "own: first line renamed" "# AGENTS.md" "$(head -n 1 "$P/own/AGENTS.md")"
+assert "own: stock header made agent-neutral" grep -qx 'This file provides guidance to AI coding agents when working with code in this repository.' "$P/own/AGENTS.md"
+assert "own: rules carried over" grep -qx -- '- rule one' "$P/own/AGENTS.md"
+assert_eq "own: CLAUDE.md is the shim" "$SHIM" "$(cat "$P/own/CLAUDE.md")"
+assert "own: nothing staged" g -C "$P/own" diff --cached --quiet
+assert_eq "own/sub: left alone without --nested" "# sub rules" "$(cat "$P/own/sub/CLAUDE.md")"
+assert_not "own/sub: no AGENTS.md without --nested" test -e "$P/own/sub/AGENTS.md"
+assert "own/sub: reported" grep -q 'info    sub/CLAUDE.md is below the project root; left alone' "$TMP/am.out"
+assert "summary points at --nested" grep -q '^1 CLAUDE.md file(s) below a project root left alone' "$TMP/am.out"
+assert_not "nested AGENTS.md alone gets no shim" test -e "$P/own/docs/tpl/CLAUDE.md"
+assert "nested AGENTS.md alone reported" grep -q 'docs/tpl/AGENTS.md has no CLAUDE.md beside it' "$TMP/am.out"
+assert_not "vendor/ skipped" test -e "$P/own/vendor/lib/CLAUDE.md"
+assert_not "node_modules/ skipped" test -e "$P/own/node_modules/x/AGENTS.md"
+assert_not "nested repo skipped" test -e "$P/own/inner/AGENTS.md"
+assert_not ".claude/CLAUDE.md not converted" test -e "$P/own/.claude/AGENTS.md"
+assert_eq "forensics/ inside a project untouched" "# evidence" "$(cat "$P/own/forensics/skill/CLAUDE.md")"
+assert_not "forensics/ inside a project: no AGENTS.md" test -e "$P/own/forensics/skill/AGENTS.md"
+assert_not "forensics/ under --all ROOT not walked" test -e "$P/forensics/kit/AGENTS.md"
+assert_not "forensics/ never named in the report" grep -q forensics "$TMP/am.out"
+assert "done: reported ok" grep -q 'ok      CLAUDE.md imports AGENTS.md$' "$TMP/am.out"
+assert "half: untracked AGENTS.md reported" grep -q 'git does not track AGENTS.md' "$TMP/am.out"
+assert "half: listed to commit" grep -qx "  $P/half" "$TMP/am.out"
+assert_eq "both: CLAUDE.md untouched" "# both claude" "$(cat "$P/both/CLAUDE.md")"
+assert "both: listed for a hand merge" grep -qx "  $P/both/CLAUDE.md" "$TMP/am.out"
+assert_eq "twin: copy becomes the shim" "$SHIM" "$(cat "$P/twin/CLAUDE.md")"
+assert_eq "agentsonly: shim created" "$SHIM" "$(cat "$P/agentsonly/CLAUDE.md")"
+assert_eq "hard: CLAUDE.md untouched" "# shared" "$(cat "$P/hard/CLAUDE.md")"
+assert_eq "hard: link count held" 2 "$(nlinks "$TMP/shared.md")"
+assert_not "hard: no AGENTS.md" test -e "$P/hard/AGENTS.md"
+assert "linked: symlink kept" test -L "$P/linked/CLAUDE.md"
+assert_eq "fork: upstream-shipped CLAUDE.md untouched" "# upstream rules" "$(cat "$P/fork/CLAUDE.md")"
+assert "fork: reported as upstream's" grep -q 'upstream ships it' "$TMP/am.out"
+assert_eq "fork2: own CLAUDE.md converted" "# fork rules" "$(cat "$P/fork2/AGENTS.md")"
+
+printf '== agents-md --nested\n'
+assert_exit "--nested exits 0" 0 sat agents-md --all --nested "$P"
+assert_eq "own/sub: converted" "# sub rules" "$(cat "$P/own/sub/AGENTS.md")"
+assert_eq "own/sub: CLAUDE.md is the shim" "$SHIM" "$(cat "$P/own/sub/CLAUDE.md")"
+assert_not "--nested still skips forensics/" test -e "$P/own/forensics/skill/AGENTS.md"
+assert_not "--nested still skips the nested repo" test -e "$P/own/inner/AGENTS.md"
+
+printf '== agents-md again\n'
+assert_exit "second run exits 0" 0 sat agents-md --all "$P"
+assert "second run changes nothing" grep -q '^summary: 0 changed' "$TMP/last.out"
+assert "a nested import is still checked" grep -q 'ok      sub/CLAUDE.md imports AGENTS.md' "$TMP/last.out"
+assert_exit "--nested with another command exits 2" 2 sat status --nested
+assert_exit "a shim without AGENTS.md exits 1" 1 sat agents-md "$TMP/lone/broken"
+assert "broken shim reported" grep -q 'FAIL    CLAUDE.md imports a missing AGENTS.md' "$TMP/last.out"
+assert_exit "a subdirectory resolves to its repo" 0 sat agents-md "$P/own/sub"
+assert "header names the repo root" grep -q '^project .*/own$' "$TMP/last.out"
+assert_exit "--all with another command exits 2" 2 sat status --all
+
+printf '== agents-md --prune\n'
+before="$(tree_sum "$P")"
+assert_exit "prune --dry-run exits 0" 0 sat agents-md --all --prune --dry-run "$P"
+assert_eq "prune dry run changes nothing" "$before" "$(tree_sum "$P")"
+assert_exit "prune exits 0" 0 sat agents-md --all --prune "$P"
+assert_not "own: shim removed" test -e "$P/own/CLAUDE.md"
+assert "own: AGENTS.md stays" test -f "$P/own/AGENTS.md"
+assert_eq "own/sub: nested shim kept without --nested" "$SHIM" "$(cat "$P/own/sub/CLAUDE.md")"
+assert_exit "prune --nested exits 0" 0 sat agents-md --all --prune --nested "$P"
+assert_not "own/sub: nested shim removed with --nested" test -e "$P/own/sub/CLAUDE.md"
+assert_not "twin: shim removed" test -e "$P/twin/CLAUDE.md"
+assert_not "fork2: shim removed" test -e "$P/fork2/CLAUDE.md"
+assert "extra: Claude-only lines kept" grep -q -- '- extra' "$P/extra/CLAUDE.md"
+assert "linked: symlink kept" test -L "$P/linked/CLAUDE.md"
+assert_eq "fork: upstream CLAUDE.md kept" "# upstream rules" "$(cat "$P/fork/CLAUDE.md")"
+assert_eq "both: kept for the hand merge" "# both claude" "$(cat "$P/both/CLAUDE.md")"
+assert_eq "prune: forensics/ untouched" "# evidence" "$(cat "$P/forensics/kit/CLAUDE.md")"
+assert_exit "a path inside forensics/ is an explicit ask" 0 sat agents-md "$P/forensics/kit"
+assert_eq "explicit forensics run converts" "# evidence" "$(cat "$P/forensics/kit/AGENTS.md")"
+
 # ---------------------------------------------------------------- summary
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

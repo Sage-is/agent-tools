@@ -46,6 +46,32 @@ claude plugin install sage@sage-agent-tools
   a symlink to that file.
 - `status` and `doctor` report link state; every subcommand takes `--dry-run`.
 
+## Project rules: AGENTS.md
+
+Each project keeps its agent rules in `AGENTS.md`. `CLAUDE.md` holds one
+line, `@AGENTS.md`, because Claude Code reads `AGENTS.md` natively only from
+2.1.277 on, and only where no `CLAUDE.md` exists.
+
+```sh
+sage-agent-tools agents-md --dry-run            # the current repo
+sage-agent-tools agents-md --all --dry-run DIR  # every project directly under DIR
+sage-agent-tools agents-md --all --prune DIR    # later: delete the shims
+```
+
+- A `CLAUDE.md` alone becomes `AGENTS.md`, with the stock `/init` header made
+  agent-neutral, and `CLAUDE.md` becomes the import. An `AGENTS.md` alone at
+  the project root gets the import beside it.
+- Below a project root, a `CLAUDE.md` may be a bundled copy of someone else's
+  skill, so it is only reported. `--nested` converts or prunes those too.
+- Skipped and reported: a `CLAUDE.md` with different rules from its
+  `AGENTS.md` (merge by hand), a hardlinked one, one a fork's upstream ships
+  (checked against `upstream/HEAD`), `.claude/CLAUDE.md`, and anything under
+  `vendor/`, `third_party/`, `node_modules/`, `.venv/` or a nested repo.
+- Never entered: `forensics/`. Evidence copies stay byte-for-byte; only a run
+  given a path inside one touches it.
+- An import that points at a missing `AGENTS.md` fails the run (exit 1).
+- It never touches git. The report lists the projects left to commit.
+
 To undo it: `sage-agent-tools uninstall` removes only links that point into the
 bundle and restores the newest backup, then `brew uninstall sage-agent-tools`.
 On the plugin route: `claude plugin uninstall sage@sage-agent-tools`.

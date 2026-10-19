@@ -81,6 +81,15 @@ usage: sage-agent-tools <command> [--dry-run]
   sounds test             put an afplay shim on PATH, run opencode and claude
                           once; pass when opencode logs bubbles and veil and
                           claude logs bubbles and moon
+  agents-md [DIR]         move the project's agent rules into AGENTS.md and
+                          make CLAUDE.md a one-line "@AGENTS.md" import; DIR
+                          defaults to the current repo; never touches git
+  agents-md --all [ROOT]  the same for every project directly under ROOT
+  agents-md --prune [DIR] delete CLAUDE.md files that only import AGENTS.md,
+                          once no client runs below Claude Code 2.1.277;
+                          takes --all too
+  agents-md --nested ...  also change CLAUDE.md files below a project root
+                          (reported only by default)
   version                 print the version
 
   --dry-run               print the commands, change nothing
@@ -867,6 +876,292 @@ EOF
   return "$rc"
 }
 
+# ---------------------------------------------------------------- agents-md
+
+# Projects keep their agent rules in AGENTS.md. CLAUDE.md holds one line,
+# "@AGENTS.md", so every Claude Code version loads the same rules: 2.1.277+
+# also reads AGENTS.md natively, but only where no CLAUDE.md exists. Once no
+# client runs an older version, --prune deletes the shims. Nothing here
+# touches git: the report lists the repos left to commit.
+
+AGENTS_SHIM='@AGENTS.md'
+AGENTS_ALL=0
+AGENTS_PRUNE=0
+AGENTS_NESTED=0
+AM_ROOT=""            # the project being walked
+AM_UP=""              # its upstream ref, "?" for an upstream remote without fetched refs
+AM_HEADER=0
+AM_CHANGED_ROOTS=""   # newline-separated projects with edits to commit
+AM_MERGE=""           # newline-separated CLAUDE.md files that need a hand merge
+AM_N_CHANGE=0
+AM_N_OK=0
+AM_N_SKIP=0
+AM_N_FAIL=0
+AM_N_NESTED=0         # CLAUDE.md files below a project root left alone without --nested
+
+am_line() {
+  local fork=""
+  if [ "$AM_HEADER" = 0 ]; then
+    case "$AM_UP" in
+      "") ;;
+      "?") fork=" (fork, upstream refs not fetched)" ;;
+      *) fork=" (fork, checked against $AM_UP)" ;;
+    esac
+    say "project $AM_ROOT$fork"
+    AM_HEADER=1
+  fi
+  printf '  %-7s %s\n' "$1" "$2"
+}
+am_ok()   { AM_N_OK=$((AM_N_OK + 1)); am_line ok "$1"; }
+am_skip() { AM_N_SKIP=$((AM_N_SKIP + 1)); am_line skip "$1"; }
+am_fail() { AM_N_FAIL=$((AM_N_FAIL + 1)); am_line FAIL "$1"; }
+# am_to_commit: list the current project in the closing commit reminder
+am_to_commit() {
+  case "
+$AM_CHANGED_ROOTS" in *"
+$AM_ROOT
+"*) ;; *) AM_CHANGED_ROOTS="$AM_CHANGED_ROOTS$AM_ROOT
+" ;; esac
+}
+am_change() {
+  AM_N_CHANGE=$((AM_N_CHANGE + 1))
+  am_line "$1" "$2"
+  am_to_commit
+}
+
+# first_rule FILE: the first non-blank line
+first_rule() { grep -v -m1 '^[[:space:]]*$' "$1" 2>/dev/null || true; }
+
+# imports_agents FILE: the first non-blank line is the @AGENTS.md import
+imports_agents() {
+  case "$(first_rule "$1")" in "$AGENTS_SHIM"|"@./AGENTS.md") return 0 ;; esac
+  return 1
+}
+
+# is_shim FILE: the import is the only non-blank line
+is_shim() {
+  imports_agents "$1" || return 1
+  [ "$(grep -c -v '^[[:space:]]*$' "$1" 2>/dev/null || true)" = 1 ]
+}
+
+# am_tracked FILE: git tracks FILE (staged counts)
+am_tracked() { git -C "$(dirname "$1")" ls-files --error-unmatch -- "$(basename "$1")" >/dev/null 2>&1; }
+
+# upstream_ref ROOT: refs/remotes/upstream/{HEAD,main,master}, the first that exists
+upstream_ref() {
+  local r
+  for r in upstream/HEAD upstream/main upstream/master; do
+    if git -C "$1" rev-parse -q --verify "refs/remotes/$r" >/dev/null 2>&1; then
+      printf '%s' "$r"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# upstream_owns REL: the fork's upstream ships REL, or its refs are not fetched
+# (status 2). Converting a file upstream also edits would conflict on every sync.
+upstream_owns() {
+  [ -n "$AM_UP" ] || return 1
+  [ "$AM_UP" != "?" ] || return 2
+  git -C "$AM_ROOT" cat-file -e "$AM_UP:$1" 2>/dev/null
+}
+
+# in_nested_repo DIR: a submodule or a separate clone sits between DIR and AM_ROOT
+in_nested_repo() {
+  local d="$1"
+  while [ "${#d}" -gt "${#AM_ROOT}" ]; do
+    [ ! -e "$d/.git" ] || return 0
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+# am_convert C A: CLAUDE.md's text becomes AGENTS.md, with the stock
+# "/init" header made agent-neutral; CLAUDE.md is rewritten in place as the shim
+am_convert() {
+  if [ "$DRY_RUN" = 1 ]; then
+    dry "write $2 (from CLAUDE.md, stock header made agent-neutral)"
+  else
+    sed -e '1s/^# CLAUDE\.md/# AGENTS.md/' \
+        -e 's#^This file provides guidance to Claude Code (claude\.ai/code) when working with code in this repository\.#This file provides guidance to AI coding agents when working with code in this repository.#' \
+        "$1" > "$2"
+  fi
+  write_text "$1" "$AGENTS_SHIM"
+}
+
+# am_dir DIR: bring DIR's CLAUDE.md / AGENTS.md pair to the shim form
+am_dir() {
+  local dir="$1" c="$1/CLAUDE.md" a="$1/AGENTS.md" rel rc=0 n
+  rel="${dir#"$AM_ROOT"}"
+  rel="${rel#/}"
+  rel="${rel:+$rel/}"
+  if [ "$(basename "$dir")" = .claude ]; then
+    am_skip "${rel}CLAUDE.md: move these rules into the root AGENTS.md by hand"
+    return 0
+  fi
+
+  if [ -L "$c" ]; then
+    if [ -e "$a" ] && [ "$c" -ef "$a" ]; then
+      am_ok "${rel}CLAUDE.md -> AGENTS.md (symlink)"
+    else
+      am_skip "${rel}CLAUDE.md is a symlink to $(readlink "$c")"
+    fi
+    return 0
+  fi
+
+  # below the root a CLAUDE.md may be a bundled copy of someone else's skill:
+  # report it, and change it only under --nested (an existing import is still checked)
+  if [ -n "$rel" ] && [ "$AGENTS_NESTED" = 0 ] && [ -f "$c" ]; then
+    if [ "$AGENTS_PRUNE" = 1 ] || ! imports_agents "$c"; then
+      AM_N_NESTED=$((AM_N_NESTED + 1))
+      am_line info "${rel}CLAUDE.md is below the project root; left alone"
+      return 0
+    fi
+  fi
+
+  if [ "$AGENTS_PRUNE" = 1 ]; then
+    [ -f "$c" ] || return 0
+    if ! imports_agents "$c"; then
+      am_skip "${rel}CLAUDE.md holds its own rules; run agents-md without --prune first"
+    elif [ ! -f "$a" ]; then
+      am_fail "${rel}CLAUDE.md imports a missing ${rel}AGENTS.md"
+    elif ! is_shim "$c"; then
+      am_ok "${rel}CLAUDE.md kept: Claude Code-only lines follow the import"
+    else
+      upstream_owns "${rel}CLAUDE.md" || rc=$?
+      if [ "$rc" = 0 ]; then
+        am_skip "${rel}CLAUDE.md: upstream ships it"
+      elif [ "$rc" = 2 ]; then
+        am_skip "${rel}CLAUDE.md: fork without upstream refs; git fetch upstream, then rerun"
+      else
+        am_change remove "${rel}CLAUDE.md (only imported AGENTS.md)"
+        run rm -f "$c"
+      fi
+    fi
+    return 0
+  fi
+
+  if [ -f "$c" ] && imports_agents "$c"; then
+    if [ ! -f "$a" ]; then
+      am_fail "${rel}CLAUDE.md imports a missing ${rel}AGENTS.md"
+    elif am_tracked "$c" && ! am_tracked "$a"; then
+      am_ok "${rel}CLAUDE.md imports AGENTS.md, but git does not track ${rel}AGENTS.md: commit both"
+      am_to_commit
+    else
+      am_ok "${rel}CLAUDE.md imports AGENTS.md"
+    fi
+    return 0
+  fi
+
+  if [ -f "$c" ]; then
+    # GNU first: on Linux "stat -f %l" succeeds and prints the filename limit
+    n="$(stat -c %h "$c" 2>/dev/null || stat -f %l "$c")"
+    if [ "$n" -gt 1 ]; then
+      am_skip "${rel}CLAUDE.md is hardlinked ($n links); convert it by hand so the chain holds"
+      return 0
+    fi
+    upstream_owns "${rel}CLAUDE.md" || rc=$?
+    if [ "$rc" = 0 ]; then
+      am_skip "${rel}CLAUDE.md: upstream ships it; keep it so syncs merge cleanly"
+      return 0
+    elif [ "$rc" = 2 ]; then
+      am_skip "${rel}CLAUDE.md: fork without upstream refs; git fetch upstream, then rerun"
+      return 0
+    fi
+    if [ -e "$a" ]; then
+      if cmp -s "$c" "$a"; then
+        am_change shim "${rel}CLAUDE.md (a copy of AGENTS.md) now imports it"
+        write_text "$c" "$AGENTS_SHIM"
+      else
+        am_skip "${rel}CLAUDE.md and ${rel}AGENTS.md hold different rules: merge into AGENTS.md by hand"
+        AM_MERGE="$AM_MERGE$c
+"
+      fi
+      return 0
+    fi
+    am_change convert "${rel}CLAUDE.md -> ${rel}AGENTS.md; CLAUDE.md now imports it"
+    am_convert "$c" "$a"
+    return 0
+  fi
+
+  # AGENTS.md alone. Deeper down it may be a template or another tool's file,
+  # so only the project root gets a shim.
+  if [ -n "$rel" ]; then
+    am_line info "${rel}AGENTS.md has no CLAUDE.md beside it; left alone"
+    return 0
+  fi
+  am_change shim "CLAUDE.md created, imports AGENTS.md"
+  write_text "$c" "$AGENTS_SHIM"
+}
+
+# am_project DIR: walk one project, skipping vendored trees, nested repos and
+# forensics/ (evidence copies stay byte-for-byte; only a run aimed inside one
+# touches it)
+am_project() {
+  local root dirs d
+  root="$(cd "$1" && pwd)"
+  AM_ROOT="$root"
+  AM_HEADER=0
+  AM_UP=""
+  if git -C "$root" remote get-url upstream >/dev/null 2>&1; then
+    AM_UP="$(upstream_ref "$root")" || AM_UP="?"
+  fi
+  dirs="$(find "$root" -mindepth 1 \
+            \( -name .git -o -name node_modules -o -name vendor -o -name third_party -o -name .venv -o -name forensics \) -prune \
+            -o \( -name CLAUDE.md -o -name AGENTS.md \) -print 2>/dev/null \
+          | sed 's#/[^/]*$##' | LC_ALL=C sort -u)"
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    if [ "$d" != "$root" ] && in_nested_repo "$d"; then continue; fi
+    am_dir "$d"
+  done <<EOF
+$dirs
+EOF
+}
+
+cmd_agents_md() {
+  local target="${1:-.}" d top r
+  [ -d "$target" ] || die 2 "not a directory: $target"
+  if [ "$AGENTS_PRUNE" = 1 ]; then
+    say "sage-agent-tools v$VERSION agents-md --prune: delete CLAUDE.md files that only import AGENTS.md"
+  else
+    say "sage-agent-tools v$VERSION agents-md: rules in AGENTS.md, CLAUDE.md imports them"
+  fi
+  [ "$DRY_RUN" = 0 ] || say "dry run: printing commands, changing nothing"
+  if [ "$AGENTS_ALL" = 1 ]; then
+    for d in "$target"/*/; do
+      d="${d%/}"
+      [ -d "$d" ] && [ ! -L "$d" ] || continue
+      [ "$(basename "$d")" != forensics ] || continue
+      am_project "$d"
+    done
+  else
+    top="$(git -C "$target" rev-parse --show-toplevel 2>/dev/null || true)"
+    am_project "${top:-$target}"
+    [ "$AM_HEADER" = 1 ] || say "project $AM_ROOT: no CLAUDE.md or AGENTS.md"
+  fi
+
+  say ""
+  say "summary: $AM_N_CHANGE changed, $AM_N_OK ok, $AM_N_SKIP skipped, $AM_N_FAIL failed"
+  if [ "$AM_N_NESTED" -gt 0 ]; then
+    say "$AM_N_NESTED CLAUDE.md file(s) below a project root left alone; check them, then rerun with --nested to include them"
+  fi
+  if [ -n "$AM_MERGE" ]; then
+    say "merge by hand into AGENTS.md, then rerun:"
+    printf '%s' "$AM_MERGE" | sed 's/^/  /'
+  fi
+  if [ -n "$AM_CHANGED_ROOTS" ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      say "CLAUDE.md / AGENTS.md changes to commit after a real run:"
+    else
+      say "[MANUALLY] review and commit CLAUDE.md / AGENTS.md in:"
+    fi
+    printf '%s' "$AM_CHANGED_ROOTS" | sed 's/^/  /'
+  fi
+  [ "$AM_N_FAIL" = 0 ]
+}
+
 # ---------------------------------------------------------------- main
 
 main() {
@@ -875,6 +1170,9 @@ main() {
     case "$a" in
       --dry-run) DRY_RUN=1 ;;
       --claude-hooks) CLAUDE_HOOKS=1 ;;
+      --all) AGENTS_ALL=1 ;;
+      --prune) AGENTS_PRUNE=1 ;;
+      --nested) AGENTS_NESTED=1 ;;
       -h|--help|help) usage; exit 0 ;;
       -V|--version) say "sage-agent-tools v$VERSION"; exit 0 ;;
       -*) usage >&2; die 2 "unknown option: $a" ;;
@@ -892,6 +1190,14 @@ main() {
   if [ "$pos1" = version ] && [ -z "$pos2" ]; then
     say "sage-agent-tools v$VERSION"
     exit 0
+  fi
+  if [ "$pos1" = agents-md ]; then
+    cmd_agents_md "$pos2"
+    exit 0
+  fi
+  if [ "$AGENTS_ALL$AGENTS_PRUNE$AGENTS_NESTED" != 000 ]; then
+    usage >&2
+    die 2 "--all, --prune and --nested go with agents-md only"
   fi
   resolve_prefix
   find_bundles
